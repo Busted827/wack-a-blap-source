@@ -1,0 +1,1637 @@
+
+
+===== WhackGame.tsx (783 lines) =====
+
+import { useEffect, useRef, useState } from "react";
+import { Volume2, VolumeX } from "lucide-react";
+import {
+  isMuted,
+  playEscape,
+  playHit,
+  playOver,
+  playPop,
+  playStart,
+  playWhiff,
+  pressDrone,
+  resumeAudio,
+  setMuted,
+  speak,
+  startDrone,
+  stopDrone,
+  unlockAudio,
+} from "@/game/audio";
+
+const LABELS = ["Q", "W", "E", "A", "S", "D", "Z", "X", "C"] as const;
+const HOLE_BY_CODE: Record<string, number> = {
+  KeyQ: 0,
+  KeyW: 1,
+  KeyE: 2,
+  KeyA: 3,
+  KeyS: 4,
+  KeyD: 5,
+  KeyZ: 6,
+  KeyX: 7,
+  KeyC: 8,
+};
+
+const HOLE_BY_KEY: Record<string, number> = {
+  q: 0,
+  w: 1,
+  e: 2,
+  a: 3,
+  s: 4,
+  d: 5,
+  z: 6,
+  x: 7,
+  c: 8,
+};
+
+function thump(ms: number) {
+  if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+    navigator.vibrate(ms);
+  }
+}
+
+function holeFromEvent(e: KeyboardEvent) {
+  return HOLE_BY_CODE[e.code] ?? HOLE_BY_KEY[e.key.toLowerCase()];
+}
+
+const RAMP = 40;
+const MAX_FLED = 5;
+const BUFFER_MS = 140;
+const SLAM = 0.78;
+const SAVE_KEY = "wack-blaps-v1";
+const MUTE_KEY = "wack-blaps-mute";
+
+type Phase = "title" | "play" | "over";
+type HolePhase = "empty" | "rise" | "up" | "duck" | "splat";
+type Mood = "idle" | "roar" | "annoyed" | "laugh";
+type Flash = "hit" | "whiff" | "gone";
+
+type Kind = "blap" | "king" | "globule";
+
+type Hole = {
+  phase: HolePhase;
+  kind: Kind;
+  t: number;
+  stay: number;
+  rise: number;
+  duck: number;
+  splat: number;
+  hot: number;
+  slam: number;
+  flash: Flash | null;
+  flashT: number;
+  strikeAt: number;
+};
+
+type Floater = { id: number; hole: number; text: string; kind: "score" | "bad"; life: number };
+type Particle = {
+  id: number;
+  hole: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  max: number;
+  size: number;
+  kind: "blood" | "spark" | "cyan";
+};
+
+type Sim = {
+  phase: Phase;
+  reason: "fled";
+  elapsed: number;
+  score: number;
+  combo: number;
+  bestCombo: number;
+  crushed: number;
+  fled: number;
+  best: number;
+  prevBest: number;
+  newBest: boolean;
+  spawnIn: number;
+  mercy: number;
+  kingIn: number;
+  holes: Hole[];
+  mood: Mood;
+  moodT: number;
+  bark: string;
+  idleIn: number;
+  trauma: number;
+  clock: number;
+  freeze: number;
+  floaters: Floater[];
+  particles: Particle[];
+  reduced: boolean;
+  nextId: number;
+};
+
+const BARKS: Record<Mood, string[]> = {
+  idle: ["PRAISE BE.", "MADE IN HIS IMAGE.", "GIFTED WITH FLESH.", "BLESSED WITH PURPOSE."],
+  roar: [
+    "PRAISE BE TO SPACE KING.",
+    "GO, BROTHERS.",
+    "CRACKING HEADS.",
+    "WE WILL BE REBORN.",
+    "ARMORED IN PSYCHOSIS.",
+  ],
+  annoyed: ["YOU'RE RUNNING OUT OF TIME.", "IT FLED.", "TOO SLOW, BROTHER."],
+  laugh: ["ENDLESS WAR.", "PRAISE BE.", "FOR THE SPACE KING."],
+};
+
+function pick(mood: Mood) {
+  const lines = BARKS[mood];
+  return lines[Math.floor(Math.random() * lines.length)] ?? "EYES UP.";
+}
+
+function clockLabel(seconds: number) {
+  const whole = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(whole / 60);
+  const remain = whole % 60;
+  return `${minutes}:${remain.toString().padStart(2, "0")}`;
+}
+
+function emptyHole(): Hole {
+  return {
+    phase: "empty",
+    kind: "blap",
+    t: 0,
+    stay: 1,
+    rise: 0.16,
+    duck: 0.2,
+    splat: 0.42,
+    hot: 0,
+    slam: 0,
+    flash: null,
+    flashT: 0,
+    strikeAt: 0,
+  };
+}
+
+function createSim(best: number): Sim {
+  return {
+    phase: "title",
+    reason: "fled",
+    elapsed: 0,
+    score: 0,
+    combo: 0,
+    bestCombo: 0,
+    crushed: 0,
+    fled: 0,
+    best,
+    prevBest: best,
+    newBest: false,
+    spawnIn: 0.4,
+    mercy: 0,
+    kingIn: 8,
+    holes: Array.from({ length: 9 }, emptyHole),
+    mood: "roar",
+    moodT: 0,
+    bark: "HOLD THE DECK.",
+    idleIn: 3,
+    trauma: 0,
+    clock: 0,
+    freeze: 0,
+    floaters: [],
+    particles: [],
+    reduced: false,
+    nextId: 1,
+  };
+}
+
+function loadBest() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw) as { best?: number };
+    return typeof parsed.best === "number" && parsed.best > 0 ? parsed.best : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function tune(elapsed: number) {
+  const p = Math.max(0, elapsed) / RAMP;
+  const head = Math.min(1, p);
+  const ease = 1 - Math.exp(-Math.max(0, p - 1) * 0.55);
+  let maxUp = Math.min(4, 1 + Math.floor(head * 2.2 + ease * 1.5));
+  if (elapsed < 8) maxUp = 1;
+  else maxUp = Math.max(2, maxUp);
+  return {
+    maxUp,
+    stay: Math.max(0.3, 1.2 - head * 0.66 - ease * 0.24),
+    rise: Math.max(0.05, 0.16 - head * 0.07 - ease * 0.03),
+    duck: Math.max(0.12, 0.2 - ease * 0.05),
+    gap: Math.max(0.16, 0.9 - head * 0.56 - ease * 0.18),
+  };
+}
+
+function hitable(h: Hole) {
+  if (h.phase === "rise" || h.phase === "up") return true;
+  if (h.phase === "duck") return h.t < h.duck * 0.55;
+  return false;
+}
+
+function setMood(s: Sim, mood: Mood, time: number) {
+  s.mood = mood;
+  s.moodT = time;
+  s.bark = pick(mood);
+  if (mood !== "idle") speak(s.bark);
+  if (mood === "idle") s.idleIn = 3.2;
+}
+
+function spawnFloat(s: Sim, hole: number, text: string, kind: Floater["kind"]) {
+  s.floaters.push({ id: s.nextId++, hole, text, kind, life: 0.7 });
+}
+
+function spawnBlood(s: Sim, hole: number) {
+  const count = s.reduced ? 4 : 12;
+  for (let n = 0; n < count; n++) {
+    const ang = -Math.PI * (0.15 + Math.random() * 0.7);
+    const sp = 28 + Math.random() * 55;
+    s.particles.push({
+      id: s.nextId++,
+      hole,
+      x: (Math.random() - 0.5) * 16,
+      y: -8,
+      vx: Math.cos(ang) * sp,
+      vy: Math.sin(ang) * sp,
+      life: 0.32 + Math.random() * 0.28,
+      max: 0.55,
+      size: 4 + Math.random() * 7,
+      kind: Math.random() > 0.75 ? "spark" : "blood",
+    });
+  }
+  if (s.particles.length > 64) s.particles.splice(0, s.particles.length - 64);
+}
+
+function crush(s: Sim, index: number) {
+  const h = s.holes[index];
+  if (!h) return;
+  const kind = h.kind;
+  h.phase = "splat";
+  h.t = 0;
+  h.splat = SLAM;
+  h.strikeAt = 0;
+  h.slam = SLAM;
+  h.flash = "hit";
+  h.flashT = 0.45;
+  s.combo += 1;
+  s.bestCombo = Math.max(s.bestCombo, s.combo);
+  let gained = 100 + (s.combo - 1) * 25;
+  let label = `+${gained}`;
+  if (kind === "king") {
+    gained *= 3;
+    label = `+${gained}`;
+  }
+  if (kind === "globule") {
+    const forgiven = s.fled > 0;
+    if (forgiven) s.fled -= 1;
+    s.mercy = 3.4;
+    gained += 200;
+    label = forgiven ? "SAVED" : "SLOW";
+  }
+  s.score += gained;
+  s.crushed += 1;
+  s.freeze = s.reduced ? 0 : 0.048;
+  s.trauma = Math.min(1, s.trauma + (s.reduced ? 0 : 0.42));
+  setMood(s, s.combo >= 8 ? "laugh" : "roar", 0.62);
+  spawnFloat(s, index, label, "score");
+  spawnBlood(s, index);
+  playHit();
+  if (!s.reduced) thump(22);
+}
+
+function whiff(s: Sim, index: number) {
+  const h = s.holes[index];
+  if (!h) return;
+  h.strikeAt = 0;
+  h.slam = SLAM;
+  const had = s.combo;
+  s.combo = 0;
+  h.flash = "whiff";
+  h.flashT = 0.16;
+  s.trauma = Math.min(1, s.trauma + (s.reduced ? 0 : 0.14));
+  setMood(s, "annoyed", 0.45);
+  if (had >= 3) spawnFloat(s, index, "COMBO", "bad");
+  playWhiff();
+  if (!s.reduced) thump(10);
+}
+
+function finish(s: Sim) {
+  if (s.phase !== "play") return;
+  s.phase = "over";
+  s.reason = "fled";
+  s.newBest = s.score > s.prevBest && s.score > 0;
+  if (s.score > s.best) s.best = s.score;
+  s.prevBest = s.best;
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ version: 1, best: s.best }));
+  } catch {
+    /* ignore quota */
+  }
+  setMood(s, "annoyed", 6);
+  stopDrone();
+  playOver(false);
+}
+
+function escape(s: Sim, h: Hole) {
+  s.fled += h.kind === "king" ? 2 : 1;
+  s.combo = 0;
+  h.flash = "gone";
+  h.flashT = 0.22;
+  setMood(s, "annoyed", 0.5);
+  if (h.kind === "king") s.bark = "THE KING SAW THAT.";
+  playEscape();
+  if (s.fled >= MAX_FLED) finish(s);
+}
+
+function resolveStrikes(s: Sim, now: number) {
+  for (let i = 0; i < s.holes.length; i++) {
+    const h = s.holes[i];
+    if (!h || !h.strikeAt) continue;
+    if (hitable(h)) {
+      crush(s, i);
+      continue;
+    }
+    if (h.phase === "splat") {
+      h.strikeAt = 0;
+      continue;
+    }
+    if (now - h.strikeAt >= BUFFER_MS) whiff(s, i);
+  }
+}
+
+function step(s: Sim, dt: number, now: number) {
+  const diff = tune(s.elapsed);
+  resolveStrikes(s, now);
+  if (s.phase !== "play") return;
+
+  for (const h of s.holes) {
+    if (h.phase === "empty") continue;
+    h.t += dt;
+    if (h.phase === "rise" && h.t >= h.rise) {
+      h.phase = "up";
+      h.t = 0;
+    } else if (h.phase === "up" && h.t >= h.stay) {
+      h.phase = "duck";
+      h.t = 0;
+      escape(s, h);
+      if (s.phase !== "play") return;
+    } else if (h.phase === "splat" && h.t >= h.splat) {
+      h.phase = "empty";
+      h.kind = "blap";
+      h.t = 0;
+      h.slam = 0;
+    } else if (h.phase === "duck" && h.t >= h.duck) {
+      h.phase = "empty";
+      h.kind = "blap";
+      h.t = 0;
+    }
+  }
+
+  if (s.mercy > 0) s.mercy = Math.max(0, s.mercy - dt);
+  if (s.kingIn > 0) s.kingIn -= dt;
+  const slow = s.mercy > 0 ? 1.6 : 1;
+
+  s.spawnIn -= dt;
+  const alive = s.holes.filter((h) => h.phase !== "empty").length;
+  if (s.spawnIn <= 0 && alive < diff.maxUp) {
+    const open = s.holes
+      .map((h, i) => (h.phase === "empty" ? i : -1))
+      .filter((i) => i >= 0);
+    if (open.length) {
+      const index = open[Math.floor(Math.random() * open.length)] ?? 0;
+      const h = s.holes[index];
+      if (h) {
+        const kingUp = s.holes.some((hole) => hole.kind === "king" && hole.phase !== "empty");
+        const globUp = s.holes.some((hole) => hole.kind === "globule" && hole.phase !== "empty");
+        h.phase = "rise";
+        h.t = 0;
+        h.kind = "blap";
+        h.rise = Math.max(0.05, diff.rise);
+        h.duck = diff.duck;
+        h.stay = diff.stay * (0.88 + Math.random() * 0.24) * slow;
+        if (!kingUp && s.kingIn <= 0) {
+          h.kind = "king";
+          h.stay = diff.stay * 0.68;
+          s.kingIn = 11;
+        } else if (!globUp && Math.random() < 0.09) {
+          h.kind = "globule";
+          h.stay *= 1.08;
+        }
+        s.spawnIn = diff.gap * (0.7 + Math.random() * 0.55) * slow;
+        playPop();
+      }
+    } else {
+      s.spawnIn = 0.12;
+    }
+  }
+
+  s.elapsed += dt;
+  pressDrone(s.elapsed);
+}
+
+function advance(s: Sim, dt: number, now: number) {
+  s.clock += dt;
+  s.trauma = Math.max(0, s.trauma - dt * 1.85);
+  if (s.moodT > 0) {
+    s.moodT -= dt;
+    if (s.moodT <= 0 && s.phase === "play") {
+      s.mood = "idle";
+      s.bark = pick("idle");
+      s.idleIn = 3.2;
+    }
+  } else if (s.phase === "play" && s.mood === "idle") {
+    s.idleIn -= dt;
+    if (s.idleIn <= 0) {
+      s.bark = pick("idle");
+      s.idleIn = 3.2;
+    }
+  }
+
+  for (const h of s.holes) {
+    h.hot = Math.max(0, h.hot - dt);
+    if (h.flashT > 0) {
+      h.flashT = Math.max(0, h.flashT - dt);
+      if (h.flashT === 0) h.flash = null;
+    }
+    h.slam = Math.max(0, h.slam - dt);
+  }
+
+  for (const f of s.floaters) f.life -= dt;
+  s.floaters = s.floaters.filter((f) => f.life > 0);
+  for (const p of s.particles) {
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 110 * dt;
+  }
+  s.particles = s.particles.filter((p) => p.life > 0);
+
+  if (s.phase !== "play" || document.hidden) return;
+  if (s.freeze > 0) {
+    s.freeze -= dt;
+    return;
+  }
+  step(s, dt, now);
+}
+
+function begin(s: Sim) {
+  const best = s.best;
+  const reduced = s.reduced;
+  const next = createSim(best);
+  next.reduced = reduced;
+  next.phase = "play";
+  next.mood = "roar";
+  next.moodT = 0.8;
+  next.bark = "FOR THE SPACE KING.";
+  next.spawnIn = 0.28;
+  Object.assign(s, next);
+  s.holes = next.holes;
+  s.floaters = [];
+  s.particles = [];
+  playStart();
+  startDrone();
+  speak(next.bark);
+}
+
+function pose(h: Hole) {
+  if (h.phase === "empty") return { pop: 0, frame: 1, sx: 1, sy: 1 };
+  if (h.phase === "rise") {
+    const p = Math.min(1, h.t / Math.max(0.05, h.rise));
+    const e = 1 - (1 - p) ** 3;
+    return { pop: e, frame: e < 0.48 ? 1 : 2, sx: 0.94, sy: 1.06 };
+  }
+  if (h.phase === "up") {
+    const bob = Math.sin(h.t * 10);
+    return { pop: 1, frame: bob > 0 ? 3 : 2, sx: 1 + bob * 0.035, sy: 1 - bob * 0.03 };
+  }
+  if (h.phase === "duck") {
+    const p = Math.min(1, h.t / Math.max(0.05, h.duck));
+    return { pop: 1 - p * p, frame: p < 0.45 ? 2 : 1, sx: 1, sy: 0.96 };
+  }
+  const p = Math.min(1, h.t / Math.max(0.05, h.splat));
+  const pop = p < 0.7 ? 1 : 1 - (p - 0.7) / 0.3;
+  const squash = p < 0.12 ? 1.18 : 1;
+  return { pop, frame: 4, sx: squash, sy: 1 / squash };
+}
+
+function maceFrame(slam: number) {
+  const p = 1 - slam / SLAM;
+  if (p < 0.1) return 1;
+  if (p < 0.2) return 2;
+  if (p < 0.82) return 3;
+  return 4;
+}
+
+const WARRIOR_FRAME: Record<Mood, number> = { idle: 1, roar: 2, annoyed: 3, laugh: 4 };
+
+function queueStrike(s: Sim, index: number, now: number) {
+  const h = s.holes[index];
+  if (!h || h.strikeAt) return;
+  h.strikeAt = now;
+  h.hot = 0.14;
+}
+
+export function WhackGame() {
+  const sim = useRef<Sim>(createSim(0));
+  const [tick, setTick] = useState(0);
+  const [muted, setMutedState] = useState(false);
+
+  useEffect(() => {
+    const best = loadBest();
+    sim.current.best = best;
+    sim.current.prevBest = best;
+    sim.current.reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const mute = localStorage.getItem(MUTE_KEY) === "1";
+    setMutedState(mute);
+    setMuted(mute);
+    setTick((n) => n + 1);
+
+    const onVis = () => {
+      if (document.visibilityState === "visible") resumeAudio();
+    };
+    document.addEventListener("visibilitychange", onVis);
+
+    let last = performance.now();
+    let raf = 0;
+    const loop = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      advance(sim.current, dt, now);
+      setTick((n) => (n + 1) % 100000);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      const s = sim.current;
+      const index = holeFromEvent(e);
+      const starter = e.code === "Enter" || e.code === "Space" || index !== undefined;
+      if (s.phase !== "play") {
+        if (!starter) return;
+        if (e.code === "Space") e.preventDefault();
+        unlockAudio();
+        begin(s);
+        setTick((n) => n + 1);
+        return;
+      }
+      if (index === undefined) return;
+      e.preventDefault();
+      unlockAudio();
+      queueStrike(s, index, performance.now());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("visibilitychange", onVis);
+      stopDrone();
+    };
+  }, []);
+
+  const s = sim.current;
+  const mag = s.reduced ? 0 : s.trauma * s.trauma;
+  const shake = `translate(${Math.sin(s.clock * 54) * 14 * mag}px, ${Math.cos(s.clock * 46) * 9 * mag}px) rotate(${Math.sin(s.clock * 63) * 1.8 * mag}deg)`;
+
+  const start = () => {
+    unlockAudio();
+    begin(sim.current);
+    setTick((n) => n + 1);
+  };
+
+  const toggleMute = () => {
+    unlockAudio();
+    const next = !isMuted();
+    setMuted(next);
+    setMutedState(next);
+    try {
+      localStorage.setItem(MUTE_KEY, next ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return (
+    <main className="cabinet" data-tick={tick}>
+      <p className="sr-only" aria-live="polite">
+        {s.phase === "over"
+          ? `The blaps scurried. Score ${s.score}. Held ${clockLabel(s.elapsed)}.`
+          : s.phase === "play"
+            ? `Score ${s.score}. Fled ${s.fled} of ${MAX_FLED}.`
+            : "WACK-A-BLAP. Press to start."}
+      </p>
+
+      {s.phase === "play" ? (
+        <>
+          <header className="topbar">
+            <div>
+              <p className="kicker">Held</p>
+              <p className="score-num nums">{clockLabel(s.elapsed)}</p>
+            </div>
+            <div className="text-center">
+              <p className="kicker">Score</p>
+              <p className="score-num nums">{s.score.toLocaleString()}</p>
+            </div>
+            <button type="button" className="ghost-btn" onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"}>
+              {muted ? <VolumeX aria-hidden /> : <Volume2 aria-hidden />}
+            </button>
+          </header>
+          <div className="statrow">
+            <div>
+              <p className="kicker">Fled {s.fled}/{MAX_FLED}</p>
+              <div className="pips" aria-hidden>
+                {Array.from({ length: MAX_FLED }, (_, i) => (
+                  <span key={i} className={i < s.fled ? "pip on" : "pip"} />
+                ))}
+              </div>
+            </div>
+            <p className="bark nums">{s.combo > 1 ? `x${s.combo}  ${s.bark}` : s.bark}</p>
+          </div>
+          <div className="stage playing">
+            <aside className="warrior-card panel">
+              <img src={`/sprites/warrior-${WARRIOR_FRAME[s.mood]}.png?v=5`} alt="" draggable={false} />
+              <div>
+                <p className="kicker">Psycho warrior</p>
+                <p className="bark">{s.bark}</p>
+                <p className="hint">{s.mercy > 0 ? "Deck slow" : `Crushed ${s.crushed}`}</p>
+              </div>
+            </aside>
+            <div className="board-wrap" style={{ transform: shake }}>
+              <div className="board">
+                {s.holes.map((h, i) => {
+                  const view = pose(h);
+                  const bits = s.particles.filter((p) => p.hole === i);
+                  const notes = s.floaters.filter((f) => f.hole === i);
+                  return (
+                    <button
+                      key={LABELS[i]}
+                      type="button"
+                      className="hole"
+                      data-up={view.pop > 0.62 ? "1" : "0"}
+                      data-flash={h.flash ?? "none"}
+                      data-kind={h.phase === "empty" ? "none" : h.kind}
+                      style={h.slam > 0 ? { zIndex: 8 } : undefined}
+                      aria-label={`Strike hole ${LABELS[i]}`}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        unlockAudio();
+                        if (sim.current.phase !== "play") return;
+                        queueStrike(sim.current, i, performance.now());
+                      }}
+                    >
+                      <span className="pit" />
+                      <span className="blap-clip">
+                        {h.phase !== "empty" && (
+                          <img
+                            className="blap"
+                            src={`/sprites/blap-${view.frame}.png?v=3`}
+                            alt=""
+                            draggable={false}
+                            style={{
+                              transform: `translateY(${(1 - view.pop) * 78}%) scale(${view.sx}, ${view.sy})`,
+                            }}
+                          />
+                        )}
+                      </span>
+                      <span className="lip" />
+                      {h.slam > 0 && (
+                        <img
+                          className="mace"
+                          src={`/sprites/mace-${maceFrame(h.slam)}.png?v=9`}
+                          alt=""
+                          draggable={false}
+                          style={{
+                            transform: `translate(-50%, -58%) scale(${maceFrame(h.slam) === 3 ? 1.18 : 1})`,
+                          }}
+                        />
+                      )}
+                      {bits.map((p) => (
+                        <span
+                          key={p.id}
+                          className={`particle ${p.kind}`}
+                          style={{
+                            left: `calc(50% + ${p.x}px)`,
+                            top: `calc(42% + ${p.y}px)`,
+                            width: p.size,
+                            height: p.size,
+                            opacity: Math.max(0, p.life / p.max),
+                          }}
+                        />
+                      ))}
+                      {notes.map((f) => (
+                        <span key={f.id} className={f.kind === "score" ? "floater score" : "floater bad"}>
+                          {f.text}
+                        </span>
+                      ))}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <section className="stage menu">
+          <header className="topbar">
+            <p className="kicker">Until they scurry</p>
+            <button type="button" className="ghost-btn" onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"}>
+              {muted ? <VolumeX aria-hidden /> : <Volume2 aria-hidden />}
+            </button>
+          </header>
+          <div className="hero-row">
+            <img
+              src={
+                s.phase === "over" && s.reason === "fled"
+                  ? "/sprites/warrior-3.png?v=5"
+                  : "/sprites/warrior-2.png?v=5"
+              }
+              alt=""
+              draggable={false}
+            />
+            <div className="overlay-copy panel">
+              <p className="kicker">Psycho-warrior field exercise</p>
+              <h1 className="title">{s.phase === "title" ? "WACK-A-BLAP" : "THEY SCURRIED"}</h1>
+              {s.phase === "title" ? (
+                <p className="lede">
+                  After a few seconds, two Blaps rise at once. A gold King's Hole scores triple and counts as two escapes. A pale Globule gives an escape back and slows the deck. Five escapes and the crusade fails. Tap the hole, or use Q W E, A S D, Z X C.
+                </p>
+              ) : (
+                <>
+                  <p className="lede">
+                    Held {clockLabel(s.elapsed)}. Crushed {s.crushed}. Best combo x{Math.max(1, s.bestCombo)}.
+                  </p>
+                  <p className="score-num nums">{s.score.toLocaleString()}</p>
+                  {s.newBest && <p className="kicker">New best</p>}
+                </>
+              )}
+              <button type="button" className="play-btn" onClick={start}>
+                PRAISE BE TO SPACE KING
+              </button>
+              {typeof navigator !== "undefined" && navigator.userAgent.includes("WackBlapsApp") ? null : (
+                <a className="apk-link" href="/WACK-A-BLAP.apk" download="WACK-A-BLAP.apk">
+                  Android APK
+                </a>
+              )}
+              {s.best > 0 && <p className="nums hint">Best {s.best.toLocaleString()}</p>}
+            </div>
+          </div>
+        </section>
+      )}
+    </main>
+  );
+}
+
+
+===== audio.ts (211 lines) =====
+
+let ctx: AudioContext | null = null;
+let master: GainNode | null = null;
+let sfx: GainNode | null = null;
+let drone: OscillatorNode | null = null;
+let droneGain: GainNode | null = null;
+let noiseBuf: AudioBuffer | null = null;
+let muted = false;
+
+function context(): AudioContext | null {
+  if (typeof window === "undefined") return null;
+  if (!ctx) {
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return null;
+    ctx = new AC({ latencyHint: "interactive" });
+    master = ctx.createGain();
+    sfx = ctx.createGain();
+    sfx.connect(master);
+    master.connect(ctx.destination);
+    master.gain.value = muted ? 0.0001 : 1;
+    const len = Math.floor(ctx.sampleRate * 0.4);
+    noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  }
+  return ctx;
+}
+
+export function unlockAudio() {
+  const audio = context();
+  if (audio && audio.state === "suspended") void audio.resume();
+}
+
+export function resumeAudio() {
+  if (ctx && ctx.state === "suspended") void ctx.resume();
+}
+
+export function setMuted(next: boolean) {
+  muted = next;
+  if (next) hush();
+  if (!ctx || !master) return;
+  master.gain.setTargetAtTime(next ? 0.0001 : 1, ctx.currentTime, 0.02);
+}
+
+export function isMuted() {
+  return muted;
+}
+
+function burst(freq: number, dur: number, type: OscillatorType, peak: number, slideTo?: number) {
+  const audio = context();
+  if (!audio || !sfx) return;
+  const play = () => {
+    if (!sfx) return;
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.type = type;
+    const rate = 1 + (Math.random() * 2 - 1) * 0.04;
+    osc.frequency.setValueAtTime(freq * rate, audio.currentTime);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(40, slideTo), audio.currentTime + dur);
+    gain.gain.setValueAtTime(0.0001, audio.currentTime);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), audio.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(sfx);
+    osc.start();
+    osc.stop(audio.currentTime + dur + 0.02);
+    osc.onended = () => {
+      osc.disconnect();
+      gain.disconnect();
+    };
+  };
+  if (audio.state === "suspended") void audio.resume().then(play);
+  else play();
+}
+
+function crunch(dur: number, peak: number) {
+  const audio = context();
+  if (!audio || !sfx || !noiseBuf) return;
+  const play = () => {
+    if (!sfx || !noiseBuf) return;
+    const src = audio.createBufferSource();
+    src.buffer = noiseBuf;
+    const filter = audio.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(1400, audio.currentTime);
+    filter.frequency.exponentialRampToValueAtTime(140, audio.currentTime + dur);
+    const gain = audio.createGain();
+    gain.gain.setValueAtTime(0.0001, audio.currentTime);
+    gain.gain.exponentialRampToValueAtTime(peak, audio.currentTime + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(sfx);
+    src.start();
+    src.stop(audio.currentTime + dur + 0.02);
+    src.onended = () => {
+      src.disconnect();
+      filter.disconnect();
+      gain.disconnect();
+    };
+  };
+  if (audio.state === "suspended") void audio.resume().then(play);
+  else play();
+}
+
+export function playPop() {
+  burst(210, 0.08, "square", 0.16, 100);
+  burst(520, 0.09, "sine", 0.12, 240);
+}
+
+export function playHit() {
+  crunch(0.16, 0.48);
+  burst(90, 0.22, "sine", 0.4, 38);
+  burst(220, 0.14, "square", 0.22, 70);
+  burst(1480, 0.12, "triangle", 0.16, 420);
+  burst(860, 0.08, "square", 0.14, 240);
+}
+
+export function playWhiff() {
+  burst(160, 0.14, "triangle", 0.14, 80);
+  crunch(0.1, 0.16);
+}
+
+export function playEscape() {
+  burst(480, 0.22, "sine", 0.07, 160);
+}
+
+export function playStart() {
+  burst(220, 0.12, "square", 0.06, 330);
+  window.setTimeout(() => burst(330, 0.14, "square", 0.06, 520), 90);
+}
+
+export function playOver(win: boolean) {
+  if (win) {
+    burst(392, 0.16, "square", 0.07, 523);
+    window.setTimeout(() => burst(523, 0.22, "square", 0.07, 784), 120);
+    return;
+  }
+  burst(300, 0.28, "sawtooth", 0.05, 90);
+}
+
+export function startDrone() {
+  const audio = context();
+  if (!audio || !master || drone) return;
+  const play = () => {
+    if (!master || drone) return;
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    const filter = audio.createBiquadFilter();
+    osc.type = "sawtooth";
+    osc.frequency.value = 46;
+    filter.type = "lowpass";
+    filter.frequency.value = 220;
+    gain.gain.value = 0.0001;
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(master);
+    osc.start();
+    gain.gain.setTargetAtTime(0.028, audio.currentTime, 0.4);
+    drone = osc;
+    droneGain = gain;
+  };
+  if (audio.state === "suspended") void audio.resume().then(play);
+  else play();
+}
+
+export function pressDrone(elapsed: number) {
+  if (!ctx || !drone) return;
+  const push = Math.min(4, Math.max(0, elapsed) / 40);
+  drone.frequency.setTargetAtTime(46 + push * 16, ctx.currentTime, 0.35);
+}
+
+let lastSpoken = 0;
+
+export function speak(line: string) {
+  if (muted || typeof window === "undefined" || !window.speechSynthesis) return;
+  const now = performance.now();
+  if (now - lastSpoken < 900) return;
+  lastSpoken = now;
+  const utter = new SpeechSynthesisUtterance(line.replace(/\.$/, ""));
+  utter.rate = 1.02;
+  utter.pitch = 0.68;
+  utter.volume = 1;
+  const voices = window.speechSynthesis.getVoices();
+  const voice =
+    voices.find((item) => /en/i.test(item.lang) && /male|daniel|david|alex|fred|guy/i.test(item.name)) ??
+    voices.find((item) => /en/i.test(item.lang));
+  if (voice) utter.voice = voice;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utter);
+}
+
+export function hush() {
+  if (typeof window === "undefined" || !window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+}
+
+export function stopDrone() {
+  if (!ctx || !drone || !droneGain) return;
+  droneGain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.08);
+  const osc = drone;
+  drone = null;
+  window.setTimeout(() => {
+    try {
+      osc.stop();
+      osc.disconnect();
+    } catch {
+      /* already stopped */
+    }
+  }, 280);
+  droneGain = null;
+}
+
+
+===== styles.css (570 lines) =====
+
+@import "tailwindcss";
+
+@theme {
+  --color-soot: #100e0c;
+  --color-iron: #1b1714;
+  --color-plate: #2a241f;
+  --color-rim: #6a5b4c;
+  --color-bone: #f3ead8;
+  --color-muted: #b3a694;
+  --color-crimson: #d23a2e;
+  --color-ember: #ff6a3d;
+  --color-cyan: #3dccc8;
+  --color-gold: #e6b15a;
+  --color-blood: #2f57c8;
+  --font-display: "Black Ops One", "Arial Black", Impact, sans-serif;
+  --font-sans: "Barlow", "Avenir Next", "Segoe UI", sans-serif;
+  --radius-panel: 1.15rem;
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  html,
+  body {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-soot) url("/deck.jpg") center / cover no-repeat fixed;
+    color: var(--color-bone);
+    font-family: var(--font-sans);
+    line-height: 1.45;
+  }
+
+  h1,
+  h2 {
+    text-wrap: balance;
+  }
+}
+
+@layer components {
+  .text-center {
+    text-align: center;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .cabinet {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+    padding:
+      max(0.75rem, env(safe-area-inset-top))
+      max(0.85rem, env(safe-area-inset-right))
+      max(0.85rem, env(safe-area-inset-bottom))
+      max(0.85rem, env(safe-area-inset-left));
+    background: color-mix(in srgb, var(--color-soot) 78%, transparent);
+  }
+
+  .topbar,
+  .statrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .brand {
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
+    line-height: 1;
+    font-size: clamp(1.35rem, 3.4vw, 2rem);
+  }
+
+  .kicker {
+    color: var(--color-gold);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+
+  .nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stage {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.85rem;
+    align-items: center;
+    justify-items: center;
+    width: min(100%, 72rem);
+    margin: 0.6rem auto 0;
+  }
+
+  .panel {
+    background: color-mix(in srgb, var(--color-iron) 88%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-rim) 70%, transparent);
+    border-radius: var(--radius-panel);
+    box-shadow: 0 16px 40px rgb(0 0 0 / 0.35);
+  }
+
+  .warrior-card {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    width: min(100%, 36rem);
+    padding: 0.55rem 0.75rem;
+  }
+
+  .warrior-card img {
+    width: 4.6rem;
+    height: 6.6rem;
+    object-fit: contain;
+    object-position: center bottom;
+    flex: none;
+    filter: drop-shadow(0 8px 10px rgb(0 0 0 / 0.45));
+  }
+
+  .bark {
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    letter-spacing: 0.03em;
+    line-height: 1.15;
+  }
+
+  .board-wrap {
+    width: min(100%, 34rem);
+    position: relative;
+  }
+
+  .board {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.7rem;
+    padding: 0.85rem;
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--color-plate) 92%, white), var(--color-iron));
+    border: 3px solid var(--color-rim);
+    border-radius: 1.35rem;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.08),
+      0 18px 0 #14110f,
+      0 28px 40px rgb(0 0 0 / 0.4);
+    touch-action: none;
+  }
+
+  .hole {
+    position: relative;
+    aspect-ratio: 1;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    border-radius: 1rem;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .hole:focus-visible {
+    outline: 2px solid var(--color-gold);
+    outline-offset: 3px;
+  }
+
+  .pit {
+    position: absolute;
+    inset: 18% 8% 8%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse at 50% 42%, #070605 0 42%, #241910 72%, #4a3b30 100%);
+    box-shadow:
+      inset 0 16px 18px rgb(0 0 0 / 0.75),
+      0 0 0 5px #3c3129;
+  }
+
+  .hole[data-up="1"] .pit {
+    box-shadow:
+      inset 0 16px 18px rgb(0 0 0 / 0.75),
+      0 0 0 5px var(--color-cyan),
+      0 0 18px color-mix(in srgb, var(--color-cyan) 55%, transparent);
+  }
+
+  .hole[data-flash="hit"] .pit {
+    box-shadow:
+      inset 0 16px 18px rgb(0 0 0 / 0.55),
+      0 0 0 5px var(--color-crimson),
+      0 0 18px color-mix(in srgb, var(--color-ember) 70%, transparent);
+  }
+
+  .hole[data-flash="whiff"] .pit {
+    box-shadow:
+      inset 0 16px 18px rgb(0 0 0 / 0.75),
+      0 0 0 5px var(--color-gold);
+  }
+
+  .hole[data-kind="king"] .pit {
+    box-shadow:
+      inset 0 0 0 3px #e6b15a,
+      0 0 22px rgb(230 177 90 / 0.95);
+  }
+
+  .hole[data-kind="king"] .blap {
+    filter: sepia(1) saturate(5) hue-rotate(350deg) brightness(1.15);
+  }
+
+  .hole[data-kind="globule"] .pit {
+    box-shadow:
+      inset 0 0 0 3px #d7fff4,
+      0 0 22px rgb(180 255 236 / 0.95);
+  }
+
+  .hole[data-kind="globule"] .blap {
+    filter: grayscale(0.15) sepia(0.3) saturate(2.2) hue-rotate(125deg) brightness(1.5);
+  }
+
+  .blap-clip {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border-radius: 1rem;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .blap {
+    position: absolute;
+    left: 8%;
+    width: 84%;
+    height: 108%;
+    bottom: 10%;
+    object-fit: contain;
+    object-position: center bottom;
+    pointer-events: none;
+    filter: drop-shadow(0 8px 6px rgb(0 0 0 / 0.35));
+    transform-origin: center bottom;
+  }
+
+  .lip {
+    position: absolute;
+    left: 6%;
+    right: 6%;
+    bottom: 4%;
+    height: 28%;
+    border-radius: 50%;
+    z-index: 3;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 50% 0%, transparent 46%, #3a3028 48% 62%, #1a1512 78%);
+  }
+
+  .mace {
+    position: absolute;
+    left: 50%;
+    top: 46%;
+    width: 220%;
+    height: 220%;
+    object-fit: contain;
+    z-index: 6;
+    pointer-events: none;
+    filter: drop-shadow(0 16px 8px rgb(0 0 0 / 0.75));
+  }
+
+  .keycap {
+    position: absolute;
+    z-index: 5;
+    top: 0.15rem;
+    left: 0.15rem;
+    min-width: 1.7rem;
+    height: 1.7rem;
+    display: grid;
+    place-items: center;
+    padding: 0 0.3rem;
+    border-radius: 0.4rem;
+    background: var(--color-soot);
+    color: var(--color-gold);
+    border: 1px solid var(--color-rim);
+    font-family: var(--font-display);
+    font-size: 0.85rem;
+    line-height: 1;
+    pointer-events: none;
+  }
+
+  .hole[data-hot="1"] .keycap {
+    background: var(--color-crimson);
+    color: var(--color-bone);
+    border-color: var(--color-ember);
+  }
+
+  .floater {
+    position: absolute;
+    left: 50%;
+    top: 8%;
+    z-index: 6;
+    font-family: var(--font-display);
+    letter-spacing: 0.03em;
+    pointer-events: none;
+    animation: floatup 700ms ease-out forwards;
+    text-shadow: 0 2px 0 rgb(0 0 0 / 0.65);
+  }
+
+  .floater.score {
+    color: var(--color-gold);
+    font-size: 1.15rem;
+  }
+
+  .floater.bad {
+    color: var(--color-ember);
+    font-size: 0.85rem;
+  }
+
+  .particle {
+    position: absolute;
+    border-radius: 999px;
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  .particle.blood {
+    background: var(--color-blood);
+  }
+
+  .particle.spark {
+    background: var(--color-bone);
+  }
+
+  .particle.cyan {
+    background: var(--color-cyan);
+  }
+
+  .side {
+    width: min(100%, 34rem);
+    padding: 0.8rem 0.95rem;
+    display: grid;
+    gap: 0.45rem;
+  }
+
+  .score-num {
+    font-family: var(--font-display);
+    font-size: clamp(2rem, 6vw, 2.8rem);
+    line-height: 0.9;
+    letter-spacing: 0.03em;
+  }
+
+  .pips {
+    display: flex;
+    gap: 0.35rem;
+  }
+
+  .pip {
+    width: 0.85rem;
+    height: 0.85rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-rim) 55%, transparent);
+    box-shadow: inset 0 0 0 1px var(--color-rim);
+  }
+
+  .pip.on {
+    background: var(--color-crimson);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--color-crimson) 70%, transparent);
+  }
+
+  .play-btn {
+    font-family: var(--font-display);
+    letter-spacing: 0.06em;
+    background: var(--color-crimson);
+    color: var(--color-bone);
+    border: 0;
+    border-radius: 0.8rem;
+    padding: 0.9rem 1.2rem;
+    font-size: 1.15rem;
+    min-height: 3rem;
+    box-shadow: 0 6px 0 #6d1814;
+    touch-action: manipulation;
+  }
+
+  .play-btn:hover {
+    background: var(--color-ember);
+  }
+
+  .play-btn:active {
+    transform: translateY(3px);
+    box-shadow: 0 3px 0 #6d1814;
+  }
+
+  .play-btn:focus-visible {
+    outline: 2px solid var(--color-gold);
+    outline-offset: 3px;
+  }
+
+  .apk-link {
+    justify-self: start;
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.75rem;
+    padding: 0.45rem 0.85rem;
+    border-radius: 0.8rem;
+    border: 1px solid var(--color-gold);
+    color: var(--color-gold);
+    text-decoration: none;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 0.82rem;
+    touch-action: manipulation;
+  }
+
+  .apk-link:focus-visible {
+    outline: 2px solid var(--color-gold);
+    outline-offset: 3px;
+  }
+
+  .ghost-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    border-radius: 0.7rem;
+    border: 1px solid var(--color-rim);
+    background: color-mix(in srgb, var(--color-iron) 80%, transparent);
+    color: var(--color-bone);
+    display: grid;
+    place-items: center;
+  }
+
+  .ghost-btn:focus-visible {
+    outline: 2px solid var(--color-gold);
+    outline-offset: 2px;
+  }
+
+  .keymap {
+    display: grid;
+    grid-template-columns: repeat(3, 2.75rem);
+    gap: 0.4rem;
+    justify-content: start;
+  }
+
+  .keychip {
+    height: 2.75rem;
+    display: grid;
+    place-items: center;
+    border-radius: 0.55rem;
+    background: var(--color-soot);
+    color: var(--color-gold);
+    border: 1px solid var(--color-rim);
+    font-family: var(--font-display);
+  }
+
+  .overlay-copy {
+    width: min(100%, 40rem);
+    min-width: 0;
+    padding: 1.1rem 1.15rem 1.2rem;
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .title {
+    font-family: var(--font-display);
+    font-size: clamp(1.7rem, 8vw, 4.2rem);
+    line-height: 0.92;
+    letter-spacing: 0.03em;
+    max-width: 100%;
+  }
+
+  .lede {
+    color: var(--color-muted);
+    max-width: 38rem;
+    text-wrap: pretty;
+  }
+
+  .hero-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.8rem;
+    width: min(100%, 56rem);
+    min-width: 0;
+  }
+
+  .hero-row img {
+    width: min(42vw, 11rem);
+    height: auto;
+    object-fit: contain;
+    filter: drop-shadow(0 12px 16px rgb(0 0 0 / 0.5));
+  }
+}
+
+.hint {
+  color: var(--color-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  margin: 0.55rem 0 0;
+}
+
+@keyframes floatup {
+  from {
+    transform: translate(-50%, 0) scale(0.86);
+    opacity: 1;
+  }
+  to {
+    transform: translate(-50%, -2.6rem) scale(1.08);
+    opacity: 0;
+  }
+}
+
+.stage.menu {
+  justify-items: stretch;
+  align-content: start;
+  width: min(100%, 56rem);
+}
+
+@media (max-width: 720px) {
+  .board {
+    gap: 0.4rem;
+    padding: 0.5rem;
+  }
+
+  .board-wrap {
+    width: 100%;
+  }
+}
+
+@media (min-width: 800px) {
+  .hero-row {
+    flex-direction: row;
+    align-items: end;
+  }
+}
+
+@media (min-width: 960px) {
+  .stage.playing {
+    grid-template-columns: 15rem minmax(0, 34rem);
+    justify-content: center;
+  }
+
+  .stage.playing .warrior-card {
+    width: 100%;
+    flex-direction: column;
+    text-align: center;
+    padding: 1rem 0.8rem 1.1rem;
+  }
+
+  .stage.playing .warrior-card img {
+    width: 100%;
+    height: 14rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floater {
+    animation: none;
+    opacity: 1;
+  }
+
+  .play-btn:active {
+    transform: none;
+  }
+}
+
+
+===== index.tsx (8 lines) =====
+
+import { createFileRoute } from "@tanstack/react-router";
+import { WhackGame } from "@/game/WhackGame";
+
+export const Route = createFileRoute("/")({ component: Home });
+
+function Home() {
+  return <WhackGame />;
+}
+
+
+===== __root.tsx (45 lines) =====
+
+import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
+import { AuthProvider } from "@/lib/auth/provider";
+import { PreviewHostBridge } from "@/components/preview-host-bridge";
+import appCss from "../styles.css?url";
+
+const APP_NAME = "WACK-A-BLAP";
+
+export const Route = createRootRoute({
+  head: () => ({
+    meta: [
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
+      { title: APP_NAME },
+      { name: "theme-color", content: "#100e0c" },
+      {
+        name: "description",
+        content: "Whack Blap-Blaps through nine deck holes. Keys Q W E A S D Z X C.",
+      },
+    ],
+    links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "stylesheet", href: appCss },
+      { rel: "manifest", href: "/__grok/manifest.webmanifest" },
+      { rel: "apple-touch-icon", href: "/__grok/icon-180.png" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Barlow:wght@500;700&family=Black+Ops+One&display=swap",
+      },
+    ],
+  }),
+  component: () => (
+    <html lang="en" className="antialiased" suppressHydrationWarning>
+      <head>
+        <HeadContent />
+      </head>
+      <body>
+        <PreviewHostBridge />
+        <AuthProvider>
+          <Outlet />
+        </AuthProvider>
+        <Scripts />
+      </body>
+    </html>
+  ),
+});
